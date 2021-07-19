@@ -17,25 +17,34 @@
 
 package compression
 
+import "io"
+
+type Level int
+
+const (
+	Default Level = iota
+	Faster
+	Better
+)
+
 // Provider is a interface of compression providers
 type Provider interface {
-	// CanCompress checks if the compression method is available under the current version.
-	CanCompress() bool
+	// Return the max possible size for a compressed buffer given the uncompressed data size
+	CompressMaxSize(originalSize int) int
 
 	// Compress a []byte, the param is a []byte with the uncompressed content.
 	// The reader/writer indexes will not be modified. The return is a []byte
 	// with the compressed content.
-	Compress(data []byte) []byte
+	Compress(dst, src []byte) []byte
 
 	// Decompress a []byte. The buffer needs to have been compressed with the matching Encoder.
-	// The compressedData is compressed content, originalSize is the size of the original content.
+	// The src is compressed content. If dst is passed, the decompressed data will be written there
 	// The return were the result will be passed, if err is nil, the buffer was decompressed, no nil otherwise.
-	Decompress(compressedData []byte, originalSize int) ([]byte, error)
-}
+	Decompress(dst, src []byte, originalSize int) ([]byte, error)
 
-var (
-	NoopProvider = NewNoopProvider()
-	ZLibProvider = NewZLibProvider()
-	Lz4Provider  = NewLz4Provider()
-	ZStdProvider = NewZStdProvider()
-)
+	// Returns a new instance of the same provider, with the same exact configuration
+	Clone() Provider
+
+	// Close the compressor
+	io.Closer
+}

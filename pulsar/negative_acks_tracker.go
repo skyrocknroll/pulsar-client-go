@@ -21,7 +21,7 @@ import (
 	"sync"
 	"time"
 
-	log "github.com/sirupsen/logrus"
+	log "github.com/apache/pulsar-client-go/pulsar/log"
 )
 
 type redeliveryConsumer interface {
@@ -32,26 +32,29 @@ type negativeAcksTracker struct {
 	sync.Mutex
 
 	doneCh       chan interface{}
+	doneOnce     sync.Once
 	negativeAcks map[messageID]time.Time
 	rc           redeliveryConsumer
 	tick         *time.Ticker
 	delay        time.Duration
+	log          log.Logger
 }
 
-func newNegativeAcksTracker(rc redeliveryConsumer, delay time.Duration) *negativeAcksTracker {
+func newNegativeAcksTracker(rc redeliveryConsumer, delay time.Duration, logger log.Logger) *negativeAcksTracker {
 	t := &negativeAcksTracker{
 		doneCh:       make(chan interface{}),
 		negativeAcks: make(map[messageID]time.Time),
 		rc:           rc,
 		tick:         time.NewTicker(delay / 3),
 		delay:        delay,
+		log:          logger,
 	}
 
 	go t.track()
 	return t
 }
 
-func (t *negativeAcksTracker) Add(msgID *messageID) {
+func (t *negativeAcksTracker) Add(msgID messageID) {
 	// Always clear up the batch index since we want to track the nack
 	// for the entire batch
 	batchMsgID := messageID{
@@ -77,19 +80,20 @@ func (t *negativeAcksTracker) track() {
 	for {
 		select {
 		case <-t.doneCh:
-			log.Debug("Closing nack tracker")
+			t.log.Debug("Closing nack tracker")
 			return
 
 		case <-t.tick.C:
 			{
-				t.Lock()
-
 				now := time.Now()
 				msgIds := make([]messageID, 0)
+
+				t.Lock()
+
 				for msgID, targetTime := range t.negativeAcks {
-					log.Debugf("MsgId: %v -- targetTime: %v -- now: %v", msgID, targetTime, now)
+					t.log.Debugf("MsgId: %v -- targetTime: %v -- now: %v", msgID, targetTime, now)
 					if targetTime.Before(now) {
-						log.Debugf("Adding MsgId: %v", msgID)
+						t.log.Debugf("Adding MsgId: %v", msgID)
 						msgIds = append(msgIds, msgID)
 						delete(t.negativeAcks, msgID)
 					}
@@ -107,5 +111,9 @@ func (t *negativeAcksTracker) track() {
 }
 
 func (t *negativeAcksTracker) Close() {
-	t.doneCh <- nil
+	// allow Close() to be invoked multiple times by consumer_partition to avoid panic
+	t.doneOnce.Do(func() {
+		t.tick.Stop()
+		t.doneCh <- nil
+	})
 }

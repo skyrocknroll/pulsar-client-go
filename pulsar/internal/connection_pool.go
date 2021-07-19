@@ -18,13 +18,14 @@
 package internal
 
 import (
+	"fmt"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apache/pulsar-client-go/pulsar/internal/auth"
-
-	log "github.com/sirupsen/logrus"
+	"github.com/apache/pulsar-client-go/pulsar/log"
 )
 
 // ConnectionPool is a interface of connection pool.
@@ -37,55 +38,91 @@ type ConnectionPool interface {
 }
 
 type connectionPool struct {
-	pool              sync.Map
-	connectionTimeout time.Duration
-	tlsOptions        *TLSOptions
-	auth              auth.Provider
+	sync.Mutex
+	connections           map[string]*connection
+	connectionTimeout     time.Duration
+	tlsOptions            *TLSOptions
+	auth                  auth.Provider
+	maxConnectionsPerHost int32
+	roundRobinCnt         int32
+	metrics               *Metrics
+
+	log log.Logger
 }
 
 // NewConnectionPool init connection pool.
-func NewConnectionPool(tlsOptions *TLSOptions, auth auth.Provider, connectionTimeout time.Duration) ConnectionPool {
+func NewConnectionPool(
+	tlsOptions *TLSOptions,
+	auth auth.Provider,
+	connectionTimeout time.Duration,
+	maxConnectionsPerHost int,
+	logger log.Logger,
+	metrics *Metrics) ConnectionPool {
 	return &connectionPool{
-		tlsOptions:        tlsOptions,
-		auth:              auth,
-		connectionTimeout: connectionTimeout,
+		connections:           make(map[string]*connection),
+		tlsOptions:            tlsOptions,
+		auth:                  auth,
+		connectionTimeout:     connectionTimeout,
+		maxConnectionsPerHost: int32(maxConnectionsPerHost),
+		log:                   logger,
+		metrics:               metrics,
 	}
 }
 
 func (p *connectionPool) GetConnection(logicalAddr *url.URL, physicalAddr *url.URL) (Connection, error) {
-	cachedCnx, found := p.pool.Load(logicalAddr.Host)
-	if found {
-		cnx := cachedCnx.(*connection)
-		log.Debug("Found connection in cache:", cnx.logicalAddr, cnx.physicalAddr)
+	key := p.getMapKey(logicalAddr)
 
-		if err := cnx.waitUntilReady(); err == nil {
-			// Connection is ready to be used
-			return cnx, nil
+	p.Lock()
+	conn, ok := p.connections[key]
+	if ok {
+		p.log.Debugf("Found connection in pool key=%s logical_addr=%+v physical_addr=%+v",
+			key, conn.logicalAddr, conn.physicalAddr)
+
+		// remove stale/failed connection
+		if conn.closed() {
+			delete(p.connections, key)
+			p.log.Debugf("Removed connection from pool key=%s logical_addr=%+v physical_addr=%+v",
+				key, conn.logicalAddr, conn.physicalAddr)
+			conn = nil // set to nil so we create a new one
 		}
-		// The cached connection is failed
-		p.pool.Delete(logicalAddr.Host)
-		log.Debug("Removed failed connection from pool:", cnx.logicalAddr, cnx.physicalAddr)
 	}
 
-	// Try to create a new connection
-	newConnection := newConnection(logicalAddr, physicalAddr, p.tlsOptions, p.connectionTimeout, p.auth)
-	newCnx, wasCached := p.pool.LoadOrStore(logicalAddr.Host, newConnection)
-	cnx := newCnx.(*connection)
-	if !wasCached {
-		cnx.start()
+	if conn == nil {
+		conn = newConnection(connectionOptions{
+			logicalAddr:       logicalAddr,
+			physicalAddr:      physicalAddr,
+			tls:               p.tlsOptions,
+			connectionTimeout: p.connectionTimeout,
+			auth:              p.auth,
+			logger:            p.log,
+			metrics:           p.metrics,
+		})
+		p.connections[key] = conn
+		p.Unlock()
+		conn.start()
 	} else {
-		newConnection.Close()
+		// we already have a connection
+		p.Unlock()
 	}
 
-	if err := cnx.waitUntilReady(); err != nil {
-		return nil, err
-	}
-	return cnx, nil
+	err := conn.waitUntilReady()
+	return conn, err
 }
 
 func (p *connectionPool) Close() {
-	p.pool.Range(func(key, value interface{}) bool {
-		value.(Connection).Close()
-		return true
-	})
+	p.Lock()
+	for k, c := range p.connections {
+		delete(p.connections, k)
+		c.Close()
+	}
+	p.Unlock()
+}
+
+func (p *connectionPool) getMapKey(addr *url.URL) string {
+	cnt := atomic.AddInt32(&p.roundRobinCnt, 1)
+	if cnt < 0 {
+		cnt = -cnt
+	}
+	idx := cnt % p.maxConnectionsPerHost
+	return fmt.Sprint(addr.Host, '-', idx)
 }

@@ -18,7 +18,6 @@
 package pulsar
 
 import (
-	"math"
 	"time"
 )
 
@@ -27,8 +26,14 @@ type ProducerMessage struct {
 	// Payload for the message
 	Payload []byte
 
+	//Value and payload is mutually exclusive, `Value interface{}` for schema message.
+	Value interface{}
+
 	// Key sets the key of the message for routing policy
 	Key string
+
+	// OrderingKey sets the ordering key of the message
+	OrderingKey string
 
 	// Properties attach application defined properties on the message
 	Properties map[string]string
@@ -42,6 +47,9 @@ type ProducerMessage struct {
 
 	// ReplicationClusters override the replication clusters for this message.
 	ReplicationClusters []string
+
+	// Disable the replication for this message
+	DisableReplication bool
 
 	// SequenceID set the sequence id to assign to the current message
 	SequenceID *int64
@@ -63,6 +71,9 @@ type ProducerMessage struct {
 type Message interface {
 	// Topic get the topic from which this message originated from
 	Topic() string
+
+	// ProducerName returns the name of the producer that has published the message.
+	ProducerName() string
 
 	// Properties are application defined key/value pairs that will be attached to the message.
 	// Return the properties attached to the message.
@@ -87,18 +98,42 @@ type Message interface {
 	// Key get the key of the message, if any
 	Key() string
 
+	// OrderingKey get the ordering key of the message, if any
+	OrderingKey() string
+
 	// Get message redelivery count, redelivery count maintain in pulsar broker. When client nack acknowledge messages,
 	// broker will dispatch message again with message redelivery count in CommandMessage defined.
 	//
 	// Message redelivery increases monotonically in a broker, when topic switch ownership to a another broker
 	// redelivery count will be recalculated.
 	RedeliveryCount() uint32
+
+	// Check whether the message is replicated from other cluster.
+	IsReplicated() bool
+
+	// Get name of cluster, from which the message is replicated.
+	GetReplicatedFrom() string
+
+	//Get the de-serialized value of the message, according the configured
+	GetSchemaValue(v interface{}) error
 }
 
 // MessageID identifier for a particular message
 type MessageID interface {
 	// Serialize the message id into a sequence of bytes that can be stored somewhere else
 	Serialize() []byte
+
+	// Get the message ledgerID
+	LedgerID() int64
+
+	// Get the message entryID
+	EntryID() int64
+
+	// Get the message batchIdx
+	BatchIdx() int32
+
+	// Get the message partitionIdx
+	PartitionIdx() int32
 }
 
 // DeserializeMessageID reconstruct a MessageID object from its serialized representation
@@ -108,10 +143,10 @@ func DeserializeMessageID(data []byte) (MessageID, error) {
 
 // EarliestMessageID returns a messageID that points to the earliest message available in a topic
 func EarliestMessageID() MessageID {
-	return newMessageID(-1, -1, -1, -1)
+	return earliestMessageID
 }
 
 // LatestMessage returns a messageID that points to the latest message
 func LatestMessageID() MessageID {
-	return newMessageID(math.MaxInt64, math.MaxInt64, -1, -1)
+	return latestMessageID
 }

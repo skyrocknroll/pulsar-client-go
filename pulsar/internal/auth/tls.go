@@ -17,11 +17,16 @@
 
 package auth
 
-import "crypto/tls"
+import (
+	"crypto/tls"
+	"net/http"
+)
 
 type tlsAuthProvider struct {
 	certificatePath string
 	privateKeyPath  string
+	tlsCertSupplier func() (*tls.Certificate, error)
+	T               http.RoundTripper
 }
 
 // NewAuthenticationTLSWithParams initialize the authentication provider with map param.
@@ -40,6 +45,12 @@ func NewAuthenticationTLS(certificatePath string, privateKeyPath string) Provide
 	}
 }
 
+func NewAuthenticationFromTLSCertSupplier(tlsCertSupplier func() (*tls.Certificate, error)) Provider {
+	return &tlsAuthProvider{
+		tlsCertSupplier: tlsCertSupplier,
+	}
+}
+
 func (p *tlsAuthProvider) Init() error {
 	// Try to read certificates immediately to provide better error at startup
 	_, err := p.GetTLSCertificate()
@@ -51,6 +62,9 @@ func (p *tlsAuthProvider) Name() string {
 }
 
 func (p *tlsAuthProvider) GetTLSCertificate() (*tls.Certificate, error) {
+	if p.tlsCertSupplier != nil {
+		return p.tlsCertSupplier()
+	}
 	cert, err := tls.LoadX509KeyPair(p.certificatePath, p.privateKeyPath)
 	return &cert, err
 }
@@ -60,5 +74,28 @@ func (p *tlsAuthProvider) GetData() ([]byte, error) {
 }
 
 func (tlsAuthProvider) Close() error {
+	return nil
+}
+
+func (p *tlsAuthProvider) RoundTrip(req *http.Request) (*http.Response, error) {
+	return p.T.RoundTrip(req)
+}
+
+func (p *tlsAuthProvider) Transport() http.RoundTripper {
+	return p.T
+}
+
+func (p *tlsAuthProvider) WithTransport(tripper http.RoundTripper) error {
+	p.T = tripper
+	return p.configTLS()
+}
+
+func (p *tlsAuthProvider) configTLS() error {
+	cert, err := p.GetTLSCertificate()
+	if err != nil {
+		return err
+	}
+	transport := p.T.(*http.Transport)
+	transport.TLSClientConfig.Certificates = []tls.Certificate{*cert}
 	return nil
 }

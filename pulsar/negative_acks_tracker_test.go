@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/pulsar-client-go/pulsar/log"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -74,15 +75,15 @@ func (nmc *nackMockedConsumer) Wait() <-chan messageID {
 
 func TestNacksTracker(t *testing.T) {
 	nmc := newNackMockedConsumer()
-	nacks := newNegativeAcksTracker(nmc, testNackDelay)
+	nacks := newNegativeAcksTracker(nmc, testNackDelay, log.DefaultNopLogger())
 
-	nacks.Add(&messageID{
+	nacks.Add(messageID{
 		ledgerID: 1,
 		entryID:  1,
 		batchIdx: 1,
 	})
 
-	nacks.Add(&messageID{
+	nacks.Add(messageID{
 		ledgerID: 2,
 		entryID:  2,
 		batchIdx: 1,
@@ -101,31 +102,33 @@ func TestNacksTracker(t *testing.T) {
 	assert.Equal(t, int64(2), msgIds[1].entryID)
 
 	nacks.Close()
+	// allow multiple Close without panicing
+	nacks.Close()
 }
 
 func TestNacksWithBatchesTracker(t *testing.T) {
 	nmc := newNackMockedConsumer()
-	nacks := newNegativeAcksTracker(nmc, testNackDelay)
+	nacks := newNegativeAcksTracker(nmc, testNackDelay, log.DefaultNopLogger())
 
-	nacks.Add(&messageID{
+	nacks.Add(messageID{
 		ledgerID: 1,
 		entryID:  1,
 		batchIdx: 1,
 	})
 
-	nacks.Add(&messageID{
+	nacks.Add(messageID{
 		ledgerID: 1,
 		entryID:  1,
 		batchIdx: 2,
 	})
 
-	nacks.Add(&messageID{
+	nacks.Add(messageID{
 		ledgerID: 1,
 		entryID:  1,
 		batchIdx: 3,
 	})
 
-	nacks.Add(&messageID{
+	nacks.Add(messageID{
 		ledgerID: 2,
 		entryID:  2,
 		batchIdx: 1,

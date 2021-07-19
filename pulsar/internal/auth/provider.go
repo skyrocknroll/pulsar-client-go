@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 
 	"github.com/pkg/errors"
 )
@@ -41,6 +42,18 @@ type Provider interface {
 	GetData() ([]byte, error)
 
 	io.Closer
+
+	HTTPAuthProvider
+}
+
+type HTTPAuthProvider interface {
+	RoundTrip(req *http.Request) (*http.Response, error)
+	Transport() http.RoundTripper
+	WithTransport(tripper http.RoundTripper) error
+}
+
+type HTTPTransport struct {
+	T http.RoundTripper
 }
 
 // NewProvider get/create an authentication data provider which provides the data
@@ -62,6 +75,9 @@ func NewProvider(name string, params string) (Provider, error) {
 
 	case "athenz", "org.apache.pulsar.client.impl.auth.AuthenticationAthenz":
 		return NewAuthenticationAthenzWithParams(m)
+
+	case "oauth2", "org.apache.pulsar.client.impl.auth.oauth2.AuthenticationOAuth2":
+		return NewAuthenticationOAuth2WithParams(m)
 
 	default:
 		return nil, errors.New(fmt.Sprintf("invalid auth provider '%s'", name))

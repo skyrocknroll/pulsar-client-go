@@ -19,11 +19,10 @@ package pulsar
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"github.com/apache/pulsar-client-go/pulsar/internal"
-	log "github.com/sirupsen/logrus"
+	"github.com/apache/pulsar-client-go/pulsar/log"
 )
 
 type dlqRouter struct {
@@ -32,27 +31,28 @@ type dlqRouter struct {
 	policy    *DLQPolicy
 	messageCh chan ConsumerMessage
 	closeCh   chan interface{}
-	log       *log.Entry
+	log       log.Logger
 }
 
-func newDlqRouter(client Client, policy *DLQPolicy) (*dlqRouter, error) {
+func newDlqRouter(client Client, policy *DLQPolicy, logger log.Logger) (*dlqRouter, error) {
 	r := &dlqRouter{
 		client: client,
 		policy: policy,
+		log:    logger,
 	}
 
 	if policy != nil {
 		if policy.MaxDeliveries <= 0 {
-			return nil, errors.New("DLQPolicy.MaxDeliveries needs to be > 0")
+			return nil, newError(InvalidConfiguration, "DLQPolicy.MaxDeliveries needs to be > 0")
 		}
 
-		if policy.Topic == "" {
-			return nil, errors.New("DLQPolicy.Topic needs to be set to a valid topic name")
+		if policy.DeadLetterTopic == "" {
+			return nil, newError(InvalidConfiguration, "DLQPolicy.Topic needs to be set to a valid topic name")
 		}
 
 		r.messageCh = make(chan ConsumerMessage)
 		r.closeCh = make(chan interface{}, 1)
-		r.log = log.WithField("dlq-topic", policy.Topic)
+		r.log = logger.SubLogger(log.Fields{"dlq-topic": policy.DeadLetterTopic})
 		go r.run()
 	}
 	return r, nil
@@ -96,12 +96,17 @@ func (r *dlqRouter) run() {
 			producer.SendAsync(context.Background(), &ProducerMessage{
 				Payload:             msg.Payload(),
 				Key:                 msg.Key(),
+				OrderingKey:         msg.OrderingKey(),
 				Properties:          msg.Properties(),
 				EventTime:           msg.EventTime(),
 				ReplicationClusters: msg.replicationClusters,
 			}, func(MessageID, *ProducerMessage, error) {
 				r.log.WithField("msgID", msgID).Debug("Sent message to DLQ")
-				cm.Consumer.AckID(msgID)
+
+				// The Producer ack might be coming from the connection go-routine that
+				// is also used by the consumer. In that case we would get a dead-lock
+				// if we'd try to ack.
+				go cm.Consumer.AckID(msgID)
 			})
 
 		case <-r.closeCh:
@@ -132,7 +137,7 @@ func (r *dlqRouter) getProducer() Producer {
 	backoff := &internal.Backoff{}
 	for {
 		producer, err := r.client.CreateProducer(ProducerOptions{
-			Topic:                   r.policy.Topic,
+			Topic:                   r.policy.DeadLetterTopic,
 			CompressionType:         LZ4,
 			BatchingMaxPublishDelay: 100 * time.Millisecond,
 		})

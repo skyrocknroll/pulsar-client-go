@@ -36,6 +36,7 @@ type ProduceArgs struct {
 	Topic              string
 	Rate               int
 	BatchingTimeMillis int
+	BatchingMaxSize    int
 	MessageSize        int
 	ProducerQueueSize  int
 }
@@ -62,6 +63,8 @@ func newProducerCommand() *cobra.Command {
 		"Publish rate. Set to 0 to go unthrottled")
 	flags.IntVarP(&produceArgs.BatchingTimeMillis, "batching-time", "b", 1,
 		"Batching grouping time in millis")
+	flags.IntVarP(&produceArgs.BatchingMaxSize, "batching-max-size", "", 128,
+		"Max size of a batch (in KB)")
 	flags.IntVarP(&produceArgs.MessageSize, "size", "s", 1024,
 		"Message size")
 	flags.IntVarP(&produceArgs.ProducerQueueSize, "queue-size", "q", 1000,
@@ -86,6 +89,7 @@ func produce(produceArgs *ProduceArgs, stop <-chan struct{}) {
 		Topic:                   produceArgs.Topic,
 		MaxPendingMessages:      produceArgs.ProducerQueueSize,
 		BatchingMaxPublishDelay: time.Millisecond * time.Duration(produceArgs.BatchingTimeMillis),
+		BatchingMaxSize:         uint(produceArgs.BatchingMaxSize * 1024),
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -98,7 +102,7 @@ func produce(produceArgs *ProduceArgs, stop <-chan struct{}) {
 
 	ch := make(chan float64)
 
-	go func() {
+	go func(stopCh <-chan struct{}) {
 		var rateLimiter *rate.RateLimiter
 		if produceArgs.Rate > 0 {
 			rateLimiter = rate.New(produceArgs.Rate, time.Second)
@@ -106,7 +110,7 @@ func produce(produceArgs *ProduceArgs, stop <-chan struct{}) {
 
 		for {
 			select {
-			case <-stop:
+			case <-stopCh:
 				return
 			default:
 			}
@@ -128,11 +132,12 @@ func produce(produceArgs *ProduceArgs, stop <-chan struct{}) {
 				ch <- latency
 			})
 		}
-	}()
+	}(stop)
 
 	// Print stats of the publish rate and latencies
 	tick := time.NewTicker(10 * time.Second)
-	q := quantile.NewTargeted(0.90, 0.95, 0.99, 0.999, 1.0)
+	defer tick.Stop()
+	q := quantile.NewTargeted(0.50, 0.95, 0.99, 0.999, 1.0)
 	messagesPublished := 0
 
 	for {

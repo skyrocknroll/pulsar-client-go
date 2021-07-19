@@ -19,11 +19,11 @@ package internal
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 
-	"github.com/apache/pulsar-client-go/pulsar/internal/pb"
-	"github.com/golang/protobuf/proto"
-	"github.com/pkg/errors"
+	pb "github.com/apache/pulsar-client-go/pulsar/internal/pulsar_proto"
+	"github.com/gogo/protobuf/proto"
 )
 
 type connectionReader struct {
@@ -44,8 +44,10 @@ func (r *connectionReader) readFromConnection() {
 	for {
 		cmd, headersAndPayload, err := r.readSingleCommand()
 		if err != nil {
-			r.cnx.log.WithError(err).Info("Error reading from connection")
-			r.cnx.TriggerClose()
+			if !r.cnx.closed() {
+				r.cnx.log.WithError(err).Infof("Error reading from connection")
+				r.cnx.Close()
+			}
 			break
 		}
 
@@ -54,7 +56,7 @@ func (r *connectionReader) readFromConnection() {
 		if headersAndPayload != nil {
 			payloadLen = headersAndPayload.ReadableBytes()
 		}
-		r.cnx.log.Debug("Got command! ", cmd, " with payload size: ", payloadLen)
+		r.cnx.log.Debug("Got command! ", cmd, " with payload size: ", payloadLen, " maxMsgSize: ", r.cnx.maxMessageSize)
 		r.cnx.receivedCommand(cmd, headersAndPayload)
 	}
 }
@@ -66,24 +68,27 @@ func (r *connectionReader) readSingleCommand() (cmd *pb.BaseCommand, headersAndP
 			// If the buffer is empty, just go back to write at the beginning
 			r.buffer.Clear()
 		}
-		if !r.readAtLeast(4) {
-			return nil, nil, errors.New("Short read when reading frame size")
+		if err := r.readAtLeast(4); err != nil {
+			return nil, nil, fmt.Errorf("unable to read frame size: %+v", err)
 		}
 	}
 
 	// We have enough to read frame size
 	frameSize := r.buffer.ReadUint32()
-	if frameSize > MaxFrameSize {
-		r.cnx.log.Warnf("Received too big frame size. size=%d", frameSize)
-		r.cnx.TriggerClose()
-		return nil, nil, errors.New("Frame size too big")
+	maxFrameSize := r.cnx.maxMessageSize + MessageFramePadding
+	if r.cnx.maxMessageSize != 0 && int32(frameSize) > maxFrameSize {
+		frameSizeError := fmt.Errorf("received too big frame size=%d maxFrameSize=%d", frameSize, maxFrameSize)
+		r.cnx.log.Error(frameSizeError)
+		r.cnx.Close()
+		return nil, nil, frameSizeError
 	}
 
 	// Next, we read the rest of the frame
 	if r.buffer.ReadableBytes() < frameSize {
 		remainingBytes := frameSize - r.buffer.ReadableBytes()
-		if !r.readAtLeast(remainingBytes) {
-			return nil, nil, errors.New("Short read when reading frame")
+		if err := r.readAtLeast(remainingBytes); err != nil {
+			return nil, nil,
+				fmt.Errorf("unable to read frame: %+v", err)
 		}
 	}
 
@@ -103,7 +108,7 @@ func (r *connectionReader) readSingleCommand() (cmd *pb.BaseCommand, headersAndP
 	return cmd, headersAndPayload, nil
 }
 
-func (r *connectionReader) readAtLeast(size uint32) (ok bool) {
+func (r *connectionReader) readAtLeast(size uint32) error {
 	if r.buffer.WritableBytes() < size {
 		// There's not enough room in the current buffer to read the requested amount of data
 		totalFrameSize := r.buffer.ReadableBytes() + size
@@ -119,12 +124,16 @@ func (r *connectionReader) readAtLeast(size uint32) (ok bool) {
 
 	n, err := io.ReadAtLeast(r.cnx.cnx, r.buffer.WritableSlice(), int(size))
 	if err != nil {
-		r.cnx.TriggerClose()
-		return false
+		// has the connection been closed?
+		if r.cnx.closed() {
+			return errConnectionClosed
+		}
+		r.cnx.Close()
+		return err
 	}
 
 	r.buffer.WrittenBytes(uint32(n))
-	return true
+	return nil
 }
 
 func (r *connectionReader) deserializeCmd(data []byte) (*pb.BaseCommand, error) {
@@ -132,7 +141,7 @@ func (r *connectionReader) deserializeCmd(data []byte) (*pb.BaseCommand, error) 
 	err := proto.Unmarshal(data, cmd)
 	if err != nil {
 		r.cnx.log.WithError(err).Warn("Failed to parse protobuf command")
-		r.cnx.TriggerClose()
+		r.cnx.Close()
 		return nil, err
 	}
 	return cmd, nil

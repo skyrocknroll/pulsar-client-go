@@ -21,16 +21,19 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/gogo/protobuf/proto"
 
-	log "github.com/sirupsen/logrus"
-
-	"github.com/apache/pulsar-client-go/pulsar/internal/pb"
+	"github.com/apache/pulsar-client-go/pulsar/internal/compression"
+	pb "github.com/apache/pulsar-client-go/pulsar/internal/pulsar_proto"
 )
 
 const (
+	// MaxMessageSize limit message size for transfer
+	MaxMessageSize = 5 * 1024 * 1024
+	// MessageFramePadding is for metadata and other frame headers
+	MessageFramePadding = 10 * 1024
 	// MaxFrameSize limit the maximum size that pulsar allows for messages to be sent.
-	MaxFrameSize        = 5 * 1024 * 1024
+	MaxFrameSize        = MaxMessageSize + MessageFramePadding
 	magicCrc32c  uint16 = 0x0e01
 )
 
@@ -41,6 +44,8 @@ var ErrCorruptedMessage = errors.New("corrupted message")
 
 // ErrEOM is the error returned by ReadMessage when no more input is available.
 var ErrEOM = errors.New("EOF")
+
+var ErrConnectionClosed = errors.New("connection closed")
 
 func NewMessageReader(headersAndPayload Buffer) *MessageReader {
 	return &MessageReader{
@@ -114,7 +119,7 @@ func (r *MessageReader) ReadMessageMetadata() (*pb.MessageMetadata, error) {
 }
 
 func (r *MessageReader) ReadMessage() (*pb.SingleMessageMetadata, []byte, error) {
-	if r.buffer.ReadableBytes() == 0 {
+	if r.buffer.ReadableBytes() == 0 && r.buffer.Capacity() > 0 {
 		return nil, nil, ErrEOM
 	}
 	if !r.batched {
@@ -171,6 +176,8 @@ func baseCommand(cmdType pb.BaseCommand_Type, msg proto.Message) *pb.BaseCommand
 		cmd.Pong = msg.(*pb.CommandPong)
 	case pb.BaseCommand_SEND:
 		cmd.Send = msg.(*pb.CommandSend)
+	case pb.BaseCommand_SEND_ERROR:
+		cmd.SendError = msg.(*pb.CommandSendError)
 	case pb.BaseCommand_CLOSE_PRODUCER:
 		cmd.CloseProducer = msg.(*pb.CommandCloseProducer)
 	case pb.BaseCommand_CLOSE_CONSUMER:
@@ -190,45 +197,48 @@ func baseCommand(cmdType pb.BaseCommand_Type, msg proto.Message) *pb.BaseCommand
 	case pb.BaseCommand_AUTH_RESPONSE:
 		cmd.AuthResponse = msg.(*pb.CommandAuthResponse)
 	default:
-		log.Panic("Missing command type: ", cmdType)
+		panic(fmt.Sprintf("Missing command type: %v", cmdType))
 	}
 
 	return cmd
 }
 
-func addSingleMessageToBatch(wb Buffer, smm proto.Message, payload []byte) {
-	serialized, err := proto.Marshal(smm)
+func addSingleMessageToBatch(wb Buffer, smm *pb.SingleMessageMetadata, payload []byte) {
+	metadataSize := uint32(smm.Size())
+	wb.WriteUint32(metadataSize)
+
+	wb.ResizeIfNeeded(metadataSize)
+	_, err := smm.MarshalToSizedBuffer(wb.WritableSlice()[:metadataSize])
 	if err != nil {
-		log.WithError(err).Fatal("Protobuf serialization error")
+		panic(fmt.Sprintf("Protobuf serialization error: %v", err))
 	}
 
-	wb.WriteUint32(uint32(len(serialized)))
-	wb.Write(serialized)
+	wb.WrittenBytes(metadataSize)
 	wb.Write(payload)
 }
 
-func serializeBatch(wb Buffer, cmdSend proto.Message, msgMetadata proto.Message, payload []byte) {
+func serializeBatch(wb Buffer,
+	cmdSend *pb.BaseCommand,
+	msgMetadata *pb.MessageMetadata,
+	uncompressedPayload Buffer,
+	compressionProvider compression.Provider) {
 	// Wire format
 	// [TOTAL_SIZE] [CMD_SIZE][CMD] [MAGIC_NUMBER][CHECKSUM] [METADATA_SIZE][METADATA] [PAYLOAD]
-	cmdSize := proto.Size(cmdSend)
-	msgMetadataSize := proto.Size(msgMetadata)
-	payloadSize := len(payload)
+	cmdSize := uint32(proto.Size(cmdSend))
+	msgMetadataSize := uint32(proto.Size(msgMetadata))
 
-	magicAndChecksumLength := 2 + 4 /* magic + checksumLength */
-	headerContentSize := 4 + cmdSize + magicAndChecksumLength + 4 + msgMetadataSize
-	// cmdLength + cmdSize + magicLength + checksumSize + msgMetadataLength + msgMetadataSize
-	totalSize := headerContentSize + payloadSize
-
-	wb.WriteUint32(uint32(totalSize)) // External frame
+	frameSizeIdx := wb.WriterIndex()
+	wb.WriteUint32(0) // Skip frame size until we now the size
+	frameStartIdx := wb.WriterIndex()
 
 	// Write cmd
-	wb.WriteUint32(uint32(cmdSize))
-	serialized, err := proto.Marshal(cmdSend)
+	wb.WriteUint32(cmdSize)
+	wb.ResizeIfNeeded(cmdSize)
+	_, err := cmdSend.MarshalToSizedBuffer(wb.WritableSlice()[:cmdSize])
 	if err != nil {
-		log.WithError(err).Fatal("Protobuf error when serializing cmdSend")
+		panic(fmt.Sprintf("Protobuf error when serializing cmdSend: %v", err))
 	}
-
-	wb.Write(serialized)
+	wb.WrittenBytes(cmdSize)
 
 	// Create checksum placeholder
 	wb.WriteUint16(magicCrc32c)
@@ -237,20 +247,27 @@ func serializeBatch(wb Buffer, cmdSend proto.Message, msgMetadata proto.Message,
 
 	// Write metadata
 	metadataStartIdx := wb.WriterIndex()
-	wb.WriteUint32(uint32(msgMetadataSize))
-	serialized, err = proto.Marshal(msgMetadata)
+	wb.WriteUint32(msgMetadataSize)
+	wb.ResizeIfNeeded(msgMetadataSize)
+	_, err = msgMetadata.MarshalToSizedBuffer(wb.WritableSlice()[:msgMetadataSize])
 	if err != nil {
-		log.WithError(err).Fatal("Protobuf error when serializing msgMetadata")
+		panic(fmt.Sprintf("Protobuf error when serializing msgMetadata: %v", err))
 	}
+	wb.WrittenBytes(msgMetadataSize)
 
-	wb.Write(serialized)
-	wb.Write(payload)
+	// Make sure the buffer has enough space to hold the compressed data
+	// and perform the compression in-place
+	maxSize := uint32(compressionProvider.CompressMaxSize(int(uncompressedPayload.ReadableBytes())))
+	wb.ResizeIfNeeded(maxSize)
+	b := compressionProvider.Compress(wb.WritableSlice()[:0], uncompressedPayload.ReadableSlice())
+	wb.WrittenBytes(uint32(len(b)))
 
 	// Write checksum at created checksum-placeholder
-	endIdx := wb.WriterIndex()
-	checksum := Crc32cCheckSum(wb.Get(metadataStartIdx, endIdx-metadataStartIdx))
+	frameEndIdx := wb.WriterIndex()
+	checksum := Crc32cCheckSum(wb.Get(metadataStartIdx, frameEndIdx-metadataStartIdx))
 
-	// set computed checksum
+	// Set Sizes and checksum in the fixed-size header
+	wb.PutUint32(frameEndIdx-frameStartIdx, frameSizeIdx) // External frame
 	wb.PutUint32(checksum, checksumIdx)
 }
 

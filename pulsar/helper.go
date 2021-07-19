@@ -22,10 +22,10 @@ import (
 
 	pkgerrors "github.com/pkg/errors"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/gogo/protobuf/proto"
 
 	"github.com/apache/pulsar-client-go/pulsar/internal"
-	"github.com/apache/pulsar-client-go/pulsar/internal/pb"
+	pb "github.com/apache/pulsar-client-go/pulsar/internal/pulsar_proto"
 )
 
 // NewUnexpectedErrMsg instantiates an ErrUnexpectedMsg error.
@@ -53,15 +53,16 @@ func (e *unexpectedErrMsg) Error() string {
 	return msg
 }
 
-func validateTopicNames(topics ...string) error {
-	var errs error
-	for _, t := range topics {
-		if _, err := internal.ParseTopicName(t); err != nil {
-			errs = pkgerrors.Wrapf(err, "invalid topic name: %s", t)
+func validateTopicNames(topics ...string) ([]*internal.TopicName, error) {
+	tns := make([]*internal.TopicName, len(topics))
+	for i, t := range topics {
+		tn, err := internal.ParseTopicName(t)
+		if err != nil {
+			return nil, pkgerrors.Wrapf(err, "invalid topic name: %s", t)
 		}
+		tns[i] = tn
 	}
-
-	return errs
+	return tns, nil
 }
 
 func toKeyValues(metadata map[string]string) []*pb.KeyValue {

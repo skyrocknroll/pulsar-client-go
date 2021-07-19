@@ -22,28 +22,43 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	log "github.com/sirupsen/logrus"
+	"unsafe"
 
 	"github.com/apache/pulsar-client-go/pulsar/internal"
+	"github.com/apache/pulsar-client-go/pulsar/log"
+)
+
+const (
+	// defaultSendTimeout init default timeout for ack since sent.
+	defaultSendTimeout = 30 * time.Second
+
+	// defaultBatchingMaxPublishDelay init default for maximum delay to batch messages
+	defaultBatchingMaxPublishDelay = 10 * time.Millisecond
+
+	// defaultMaxBatchSize init default for maximum number of bytes per batch
+	defaultMaxBatchSize = 128 * 1024
+
+	// defaultMaxMessagesPerBatch init default num of entries in per batch.
+	defaultMaxMessagesPerBatch = 1000
+
+	// defaultPartitionsAutoDiscoveryInterval init default time interval for partitions auto discovery
+	defaultPartitionsAutoDiscoveryInterval = 1 * time.Minute
 )
 
 type producer struct {
-	sync.Mutex
+	sync.RWMutex
 	client        *client
 	options       *ProducerOptions
 	topic         string
 	producers     []Producer
+	producersPtr  unsafe.Pointer
 	numPartitions uint32
 	messageRouter func(*ProducerMessage, TopicMetadata) int
-	ticker        *time.Ticker
-
-	log *log.Entry
+	closeOnce     sync.Once
+	stopDiscovery func()
+	log           log.Logger
+	metrics       *internal.TopicMetrics
 }
-
-const defaultBatchingMaxPublishDelay = 10 * time.Millisecond
-
-var partitionsAutoDiscoveryInterval = 1 * time.Minute
 
 func getHashingFunction(s HashingScheme) func(string) uint32 {
 	switch s {
@@ -58,33 +73,55 @@ func getHashingFunction(s HashingScheme) func(string) uint32 {
 
 func newProducer(client *client, options *ProducerOptions) (*producer, error) {
 	if options.Topic == "" {
-		return nil, newError(ResultInvalidTopicName, "Topic name is required for producer")
+		return nil, newError(InvalidTopicName, "Topic name is required for producer")
+	}
+
+	if options.SendTimeout == 0 {
+		options.SendTimeout = defaultSendTimeout
+	}
+	if options.BatchingMaxMessages == 0 {
+		options.BatchingMaxMessages = defaultMaxMessagesPerBatch
+	}
+	if options.BatchingMaxSize == 0 {
+		options.BatchingMaxSize = defaultMaxBatchSize
+	}
+	if options.BatchingMaxPublishDelay <= 0 {
+		options.BatchingMaxPublishDelay = defaultBatchingMaxPublishDelay
+	}
+	if options.PartitionsAutoDiscoveryInterval <= 0 {
+		options.PartitionsAutoDiscoveryInterval = defaultPartitionsAutoDiscoveryInterval
 	}
 
 	p := &producer{
 		options: options,
 		topic:   options.Topic,
 		client:  client,
-		log:     log.WithField("topic", options.Topic),
+		log:     client.log.SubLogger(log.Fields{"topic": options.Topic}),
+		metrics: client.metrics.GetTopicMetrics(options.Topic),
 	}
 
-	var batchingMaxPublishDelay time.Duration
-	if options.BatchingMaxPublishDelay != 0 {
-		batchingMaxPublishDelay = options.BatchingMaxPublishDelay
-	} else {
-		batchingMaxPublishDelay = defaultBatchingMaxPublishDelay
+	if options.Interceptors == nil {
+		options.Interceptors = defaultProducerInterceptors
 	}
 
 	if options.MessageRouter == nil {
-		internalRouter := internal.NewDefaultRouter(
-			internal.NewSystemClock(),
+		internalRouter := NewDefaultRouter(
 			getHashingFunction(options.HashingScheme),
-			batchingMaxPublishDelay, options.DisableBatching)
+			options.BatchingMaxMessages,
+			options.BatchingMaxSize,
+			options.BatchingMaxPublishDelay,
+			options.DisableBatching)
 		p.messageRouter = func(message *ProducerMessage, metadata TopicMetadata) int {
-			return internalRouter(message.Key, metadata.NumPartitions())
+			return internalRouter(message, metadata.NumPartitions())
 		}
 	} else {
 		p.messageRouter = options.MessageRouter
+	}
+
+	if options.Schema != nil && options.Schema.GetSchemaInfo() != nil {
+		if options.Schema.GetSchemaInfo().Type == NONE {
+			options.Schema = NewBytesSchema(nil)
+		}
 	}
 
 	err := p.internalCreatePartitionsProducers()
@@ -92,16 +129,36 @@ func newProducer(client *client, options *ProducerOptions) (*producer, error) {
 		return nil, err
 	}
 
-	p.ticker = time.NewTicker(partitionsAutoDiscoveryInterval)
+	p.stopDiscovery = p.runBackgroundPartitionDiscovery(options.PartitionsAutoDiscoveryInterval)
 
+	p.metrics.ProducersOpened.Inc()
+	return p, nil
+}
+
+func (p *producer) runBackgroundPartitionDiscovery(period time.Duration) (cancel func()) {
+	var wg sync.WaitGroup
+	stopDiscoveryCh := make(chan struct{})
+	ticker := time.NewTicker(period)
+
+	wg.Add(1)
 	go func() {
-		for range p.ticker.C {
-			p.log.Debug("Auto discovering new partitions")
-			p.internalCreatePartitionsProducers()
+		defer wg.Done()
+		for {
+			select {
+			case <-stopDiscoveryCh:
+				return
+			case <-ticker.C:
+				p.log.Debug("Auto discovering new partitions")
+				p.internalCreatePartitionsProducers()
+			}
 		}
 	}()
 
-	return p, nil
+	return func() {
+		ticker.Stop()
+		close(stopDiscoveryCh)
+		wg.Wait()
+	}
 }
 
 func (p *producer) internalCreatePartitionsProducers() error {
@@ -115,6 +172,7 @@ func (p *producer) internalCreatePartitionsProducers() error {
 
 	p.Lock()
 	defer p.Unlock()
+
 	oldProducers := p.producers
 
 	if oldProducers != nil {
@@ -149,7 +207,7 @@ func (p *producer) internalCreatePartitionsProducers() error {
 		partition := partitions[partitionIdx]
 
 		go func(partitionIdx int, partition string) {
-			prod, e := newPartitionProducer(p.client, partition, p.options, partitionIdx)
+			prod, e := newPartitionProducer(p.client, partition, p.options, partitionIdx, p.metrics)
 			c <- ProducerError{
 				partition: partitionIdx,
 				prod:      prod,
@@ -179,6 +237,8 @@ func (p *producer) internalCreatePartitionsProducers() error {
 		return err
 	}
 
+	p.metrics.ProducersPartitions.Add(float64(partitionsToAdd))
+	atomic.StorePointer(&p.producersPtr, unsafe.Pointer(&p.producers))
 	atomic.StoreUint32(&p.numPartitions, uint32(len(p.producers)))
 	return nil
 }
@@ -188,8 +248,8 @@ func (p *producer) Topic() string {
 }
 
 func (p *producer) Name() string {
-	p.Lock()
-	defer p.Unlock()
+	p.RLock()
+	defer p.RUnlock()
 
 	return p.producers[0].Name()
 }
@@ -199,27 +259,30 @@ func (p *producer) NumPartitions() uint32 {
 }
 
 func (p *producer) Send(ctx context.Context, msg *ProducerMessage) (MessageID, error) {
-	p.Lock()
-	partition := p.messageRouter(msg, p)
-	pp := p.producers[partition]
-	p.Unlock()
-
-	return pp.Send(ctx, msg)
+	return p.getPartition(msg).Send(ctx, msg)
 }
 
 func (p *producer) SendAsync(ctx context.Context, msg *ProducerMessage,
 	callback func(MessageID, *ProducerMessage, error)) {
-	p.Lock()
-	partition := p.messageRouter(msg, p)
-	pp := p.producers[partition]
-	p.Unlock()
+	p.getPartition(msg).SendAsync(ctx, msg, callback)
+}
 
-	pp.SendAsync(ctx, msg, callback)
+func (p *producer) getPartition(msg *ProducerMessage) Producer {
+	// Since partitions can only increase, it's ok if the producers list
+	// is updated in between. The numPartition is updated only after the list.
+	partition := p.messageRouter(msg, p)
+	producers := *(*[]Producer)(atomic.LoadPointer(&p.producersPtr))
+	if partition >= len(producers) {
+		// We read the old producers list while the count was already
+		// updated
+		partition %= len(producers)
+	}
+	return producers[partition]
 }
 
 func (p *producer) LastSequenceID() int64 {
-	p.Lock()
-	defer p.Unlock()
+	p.RLock()
+	defer p.RUnlock()
 
 	var maxSeq int64 = -1
 	for _, pp := range p.producers {
@@ -232,8 +295,8 @@ func (p *producer) LastSequenceID() int64 {
 }
 
 func (p *producer) Flush() error {
-	p.Lock()
-	defer p.Unlock()
+	p.RLock()
+	defer p.RUnlock()
 
 	for _, pp := range p.producers {
 		if err := pp.Flush(); err != nil {
@@ -245,11 +308,17 @@ func (p *producer) Flush() error {
 }
 
 func (p *producer) Close() {
-	p.Lock()
-	defer p.Unlock()
+	p.closeOnce.Do(func() {
+		p.stopDiscovery()
 
-	for _, pp := range p.producers {
-		pp.Close()
-	}
-	p.client.handlers.Del(p)
+		p.Lock()
+		defer p.Unlock()
+
+		for _, pp := range p.producers {
+			pp.Close()
+		}
+		p.client.handlers.Del(p)
+		p.metrics.ProducersPartitions.Sub(float64(len(p.producers)))
+		p.metrics.ProducersClosed.Inc()
+	})
 }

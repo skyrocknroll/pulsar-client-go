@@ -19,25 +19,22 @@ package pulsar
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math/rand"
+	"strconv"
 	"sync"
 	"time"
 
-	log "github.com/sirupsen/logrus"
-
 	"github.com/apache/pulsar-client-go/pulsar/internal"
-	"github.com/apache/pulsar-client-go/pulsar/internal/pb"
+	pb "github.com/apache/pulsar-client-go/pulsar/internal/pulsar_proto"
+	"github.com/apache/pulsar-client-go/pulsar/log"
 )
-
-var ErrConsumerClosed = errors.New("consumer closed")
 
 const defaultNackRedeliveryDelay = 1 * time.Minute
 
 type acker interface {
-	AckID(id *messageID)
-	NackID(id *messageID)
+	AckID(id trackingMessageID)
+	NackID(id trackingMessageID)
 }
 
 type consumer struct {
@@ -52,13 +49,15 @@ type consumer struct {
 	// channel used to deliver message to clients
 	messageCh chan ConsumerMessage
 
-	dlq       *dlqRouter
-	closeOnce sync.Once
-	closeCh   chan struct{}
-	errorCh   chan error
-	ticker    *time.Ticker
+	dlq           *dlqRouter
+	rlq           *retryRouter
+	closeOnce     sync.Once
+	closeCh       chan struct{}
+	errorCh       chan error
+	stopDiscovery func()
 
-	log *log.Entry
+	log     log.Logger
+	metrics *internal.TopicMetrics
 }
 
 func newConsumer(client *client, options ConsumerOptions) (Consumer, error) {
@@ -70,8 +69,22 @@ func newConsumer(client *client, options ConsumerOptions) (Consumer, error) {
 		return nil, newError(SubscriptionNotFound, "subscription name is required for consumer")
 	}
 
-	if options.ReceiverQueueSize == 0 {
-		options.ReceiverQueueSize = 1000
+	if options.ReceiverQueueSize <= 0 {
+		options.ReceiverQueueSize = defaultReceiverQueueSize
+	}
+
+	if options.Interceptors == nil {
+		options.Interceptors = defaultConsumerInterceptors
+	}
+
+	if options.Name == "" {
+		options.Name = generateRandomName()
+	}
+
+	if options.Schema != nil && options.Schema.GetSchemaInfo() != nil {
+		if options.Schema.GetSchemaInfo().Type == NONE {
+			options.Schema = NewBytesSchema(nil)
+		}
 	}
 
 	// did the user pass in a message channel?
@@ -80,11 +93,53 @@ func newConsumer(client *client, options ConsumerOptions) (Consumer, error) {
 		messageCh = make(chan ConsumerMessage, 10)
 	}
 
-	dlq, err := newDlqRouter(client, options.DLQ)
+	if options.RetryEnable {
+		usingTopic := ""
+		if options.Topic != "" {
+			usingTopic = options.Topic
+		} else if len(options.Topics) > 0 {
+			usingTopic = options.Topics[0]
+		}
+		tn, err := internal.ParseTopicName(usingTopic)
+		if err != nil {
+			return nil, err
+		}
+
+		retryTopic := tn.Domain + "://" + tn.Namespace + "/" + options.SubscriptionName + RetryTopicSuffix
+		dlqTopic := tn.Domain + "://" + tn.Namespace + "/" + options.SubscriptionName + DlqTopicSuffix
+		if options.DLQ == nil {
+			options.DLQ = &DLQPolicy{
+				MaxDeliveries:    MaxReconsumeTimes,
+				DeadLetterTopic:  dlqTopic,
+				RetryLetterTopic: retryTopic,
+			}
+		} else {
+			if options.DLQ.DeadLetterTopic == "" {
+				options.DLQ.DeadLetterTopic = dlqTopic
+			}
+			if options.DLQ.RetryLetterTopic == "" {
+				options.DLQ.RetryLetterTopic = retryTopic
+			}
+		}
+		if options.Topic != "" && len(options.Topics) == 0 {
+			options.Topics = []string{options.Topic, options.DLQ.RetryLetterTopic}
+			options.Topic = ""
+		} else if options.Topic == "" && len(options.Topics) > 0 {
+			options.Topics = append(options.Topics, options.DLQ.RetryLetterTopic)
+		}
+	}
+
+	dlq, err := newDlqRouter(client, options.DLQ, client.log)
+	if err != nil {
+		return nil, err
+	}
+	rlq, err := newRetryRouter(client, options.DLQ, options.RetryEnable, client.log)
 	if err != nil {
 		return nil, err
 	}
 
+	// normalize as FQDN topics
+	var tns []*internal.TopicName
 	// single topic consumer
 	if options.Topic != "" || len(options.Topics) == 1 {
 		topic := options.Topic
@@ -92,19 +147,23 @@ func newConsumer(client *client, options ConsumerOptions) (Consumer, error) {
 			topic = options.Topics[0]
 		}
 
-		if err := validateTopicNames(topic); err != nil {
+		if tns, err = validateTopicNames(topic); err != nil {
 			return nil, err
 		}
-
-		return topicSubscribe(client, options, topic, messageCh, dlq)
+		topic = tns[0].Name
+		return topicSubscribe(client, options, topic, messageCh, dlq, rlq)
 	}
 
 	if len(options.Topics) > 1 {
-		if err := validateTopicNames(options.Topics...); err != nil {
+		if tns, err = validateTopicNames(options.Topics...); err != nil {
 			return nil, err
 		}
+		for i := range options.Topics {
+			options.Topics[i] = tns[i].Name
+		}
+		options.Topics = distinct(options.Topics)
 
-		return newMultiTopicConsumer(client, options, options.Topics, messageCh, dlq)
+		return newMultiTopicConsumer(client, options, options.Topics, messageCh, dlq, rlq)
 	}
 
 	if options.TopicsPattern != "" {
@@ -117,14 +176,14 @@ func newConsumer(client *client, options ConsumerOptions) (Consumer, error) {
 		if err != nil {
 			return nil, err
 		}
-		return newRegexConsumer(client, options, tn, pattern, messageCh, dlq)
+		return newRegexConsumer(client, options, tn, pattern, messageCh, dlq, rlq)
 	}
 
-	return nil, newError(ResultInvalidTopicName, "topic name is required for consumer")
+	return nil, newError(InvalidTopicName, "topic name is required for consumer")
 }
 
 func newInternalConsumer(client *client, options ConsumerOptions, topic string,
-	messageCh chan ConsumerMessage, dlq *dlqRouter, disableForceTopicCreation bool) (*consumer, error) {
+	messageCh chan ConsumerMessage, dlq *dlqRouter, rlq *retryRouter, disableForceTopicCreation bool) (*consumer, error) {
 
 	consumer := &consumer{
 		topic:                     topic,
@@ -135,13 +194,10 @@ func newInternalConsumer(client *client, options ConsumerOptions, topic string,
 		closeCh:                   make(chan struct{}),
 		errorCh:                   make(chan error),
 		dlq:                       dlq,
-		log:                       log.WithField("topic", topic),
-	}
-
-	if options.Name != "" {
-		consumer.consumerName = options.Name
-	} else {
-		consumer.consumerName = generateRandomName()
+		rlq:                       rlq,
+		log:                       client.log.SubLogger(log.Fields{"topic": topic}),
+		consumerName:              options.Name,
+		metrics:                   client.metrics.GetTopicMetrics(topic),
 	}
 
 	err := consumer.internalTopicSubscribeToPartitions()
@@ -154,16 +210,40 @@ func newInternalConsumer(client *client, options ConsumerOptions, topic string,
 	if duration <= 0 {
 		duration = defaultAutoDiscoveryDuration
 	}
-	consumer.ticker = time.NewTicker(duration)
+	consumer.stopDiscovery = consumer.runBackgroundPartitionDiscovery(duration)
 
+	return consumer, nil
+}
+
+// Name returns the name of consumer.
+func (c *consumer) Name() string {
+	return c.consumerName
+}
+
+func (c *consumer) runBackgroundPartitionDiscovery(period time.Duration) (cancel func()) {
+	var wg sync.WaitGroup
+	stopDiscoveryCh := make(chan struct{})
+	ticker := time.NewTicker(period)
+
+	wg.Add(1)
 	go func() {
-		for range consumer.ticker.C {
-			consumer.log.Debug("Auto discovering new partitions")
-			consumer.internalTopicSubscribeToPartitions()
+		defer wg.Done()
+		for {
+			select {
+			case <-stopDiscoveryCh:
+				return
+			case <-ticker.C:
+				c.log.Debug("Auto discovering new partitions")
+				c.internalTopicSubscribeToPartitions()
+			}
 		}
 	}()
 
-	return consumer, nil
+	return func() {
+		ticker.Stop()
+		close(stopDiscoveryCh)
+		wg.Wait()
+	}
 }
 
 func (c *consumer) internalTopicSubscribeToPartitions() error {
@@ -235,11 +315,15 @@ func (c *consumer) internalTopicSubscribeToPartitions() error {
 				nackRedeliveryDelay:        nackRedeliveryDelay,
 				metadata:                   metadata,
 				replicateSubscriptionState: c.options.ReplicateSubscriptionState,
-				startMessageID:             nil,
+				startMessageID:             trackingMessageID{},
 				subscriptionMode:           durable,
 				readCompacted:              c.options.ReadCompacted,
+				interceptors:               c.options.Interceptors,
+				maxReconnectToBroker:       c.options.MaxReconnectToBroker,
+				keySharedPolicy:            c.options.KeySharedPolicy,
+				schema:                     c.options.Schema,
 			}
-			cons, err := newPartitionConsumer(c, c.client, opts, c.messageCh, c.dlq)
+			cons, err := newPartitionConsumer(c, c.client, opts, c.messageCh, c.dlq, c.metrics)
 			ch <- ConsumerError{
 				err:       err,
 				partition: idx,
@@ -272,12 +356,17 @@ func (c *consumer) internalTopicSubscribeToPartitions() error {
 		return err
 	}
 
+	c.metrics.ConsumersPartitions.Add(float64(partitionsToAdd))
 	return nil
 }
 
 func topicSubscribe(client *client, options ConsumerOptions, topic string,
-	messageCh chan ConsumerMessage, dlqRouter *dlqRouter) (Consumer, error) {
-	return newInternalConsumer(client, options, topic, messageCh, dlqRouter, false)
+	messageCh chan ConsumerMessage, dlqRouter *dlqRouter, retryRouter *retryRouter) (Consumer, error) {
+	c, err := newInternalConsumer(client, options, topic, messageCh, dlqRouter, retryRouter, false)
+	if err == nil {
+		c.metrics.ConsumersOpened.Inc()
+	}
+	return c, err
 }
 
 func (c *consumer) Subscription() string {
@@ -304,10 +393,10 @@ func (c *consumer) Receive(ctx context.Context) (message Message, err error) {
 	for {
 		select {
 		case <-c.closeCh:
-			return nil, ErrConsumerClosed
+			return nil, newError(ConsumerClosed, "consumer closed")
 		case cm, ok := <-c.messageCh:
 			if !ok {
-				return nil, ErrConsumerClosed
+				return nil, newError(ConsumerClosed, "consumer closed")
 			}
 			return cm.Message, nil
 		case <-ctx.Done():
@@ -341,6 +430,55 @@ func (c *consumer) AckID(msgID MessageID) {
 	c.consumers[mid.partitionIdx].AckID(mid)
 }
 
+// ReconsumeLater mark a message for redelivery after custom delay
+func (c *consumer) ReconsumeLater(msg Message, delay time.Duration) {
+	if delay < 0 {
+		delay = 0
+	}
+	msgID, ok := c.messageID(msg.ID())
+	if !ok {
+		return
+	}
+	props := make(map[string]string)
+	for k, v := range msg.Properties() {
+		props[k] = v
+	}
+
+	reconsumeTimes := 1
+	if s, ok := props[SysPropertyReconsumeTimes]; ok {
+		reconsumeTimes, _ = strconv.Atoi(s)
+		reconsumeTimes++
+	} else {
+		props[SysPropertyRealTopic] = msg.Topic()
+		props[SysPropertyOriginMessageID] = msgID.messageID.String()
+	}
+	props[SysPropertyReconsumeTimes] = strconv.Itoa(reconsumeTimes)
+	props[SysPropertyDelayTime] = fmt.Sprintf("%d", int64(delay)/1e6)
+
+	consumerMsg := ConsumerMessage{
+		Consumer: c,
+		Message: &message{
+			payLoad:    msg.Payload(),
+			properties: props,
+			msgID:      msgID,
+		},
+	}
+	if uint32(reconsumeTimes) > c.dlq.policy.MaxDeliveries {
+		c.dlq.Chan() <- consumerMsg
+	} else {
+		c.rlq.Chan() <- RetryMessage{
+			consumerMsg: consumerMsg,
+			producerMsg: ProducerMessage{
+				Payload:      msg.Payload(),
+				Key:          msg.Key(),
+				OrderingKey:  msg.OrderingKey(),
+				Properties:   props,
+				DeliverAfter: delay,
+			},
+		}
+	}
+}
+
 func (c *consumer) Nack(msg Message) {
 	c.NackID(msg.ID())
 }
@@ -361,6 +499,8 @@ func (c *consumer) NackID(msgID MessageID) {
 
 func (c *consumer) Close() {
 	c.closeOnce.Do(func() {
+		c.stopDiscovery()
+
 		c.Lock()
 		defer c.Unlock()
 
@@ -374,9 +514,11 @@ func (c *consumer) Close() {
 		}
 		wg.Wait()
 		close(c.closeCh)
-		c.ticker.Stop()
 		c.client.handlers.Del(c)
 		c.dlq.close()
+		c.rlq.close()
+		c.metrics.ConsumersClosed.Inc()
+		c.metrics.ConsumersPartitions.Sub(float64(len(c.consumers)))
 	})
 }
 
@@ -385,7 +527,7 @@ func (c *consumer) Seek(msgID MessageID) error {
 	defer c.Unlock()
 
 	if len(c.consumers) > 1 {
-		return errors.New("for partition topic, seek command should perform on the individual partitions")
+		return newError(SeekFailed, "for partition topic, seek command should perform on the individual partitions")
 	}
 
 	mid, ok := c.messageID(msgID)
@@ -400,7 +542,7 @@ func (c *consumer) SeekByTime(time time.Time) error {
 	c.Lock()
 	defer c.Unlock()
 	if len(c.consumers) > 1 {
-		return errors.New("for partition topic, seek command should perform on the individual partitions")
+		return newError(SeekFailed, "for partition topic, seek command should perform on the individual partitions")
 	}
 
 	return c.consumers[0].SeekByTime(time)
@@ -424,6 +566,18 @@ func generateRandomName() string {
 		bytes[i] = chars[r.R.Intn(len(chars))]
 	}
 	return string(bytes)
+}
+
+func distinct(fqdnTopics []string) []string {
+	set := make(map[string]struct{})
+	uniques := make([]string, 0, len(fqdnTopics))
+	for _, topic := range fqdnTopics {
+		if _, ok := set[topic]; !ok {
+			set[topic] = struct{}{}
+			uniques = append(uniques, topic)
+		}
+	}
+	return uniques
 }
 
 func toProtoSubType(st SubscriptionType) pb.CommandSubscribe_SubType {
@@ -452,19 +606,19 @@ func toProtoInitialPosition(p SubscriptionInitialPosition) pb.CommandSubscribe_I
 	return pb.CommandSubscribe_Latest
 }
 
-func (c *consumer) messageID(msgID MessageID) (*messageID, bool) {
-	mid, ok := msgID.(*messageID)
+func (c *consumer) messageID(msgID MessageID) (trackingMessageID, bool) {
+	mid, ok := toTrackingMessageID(msgID)
 	if !ok {
-		c.log.Warnf("invalid message id type")
-		return nil, false
+		c.log.Warnf("invalid message id type %T", msgID)
+		return trackingMessageID{}, false
 	}
 
-	partition := mid.partitionIdx
+	partition := int(mid.partitionIdx)
 	// did we receive a valid partition index?
 	if partition < 0 || partition >= len(c.consumers) {
 		c.log.Warnf("invalid partition index %d expected a partition between [0-%d]",
 			partition, len(c.consumers))
-		return nil, false
+		return trackingMessageID{}, false
 	}
 
 	return mid, true

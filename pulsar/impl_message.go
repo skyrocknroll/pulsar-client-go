@@ -18,27 +18,52 @@
 package pulsar
 
 import (
+	"fmt"
+	"math"
 	"math/big"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/gogo/protobuf/proto"
 
-	"github.com/apache/pulsar-client-go/pulsar/internal/pb"
+	pb "github.com/apache/pulsar-client-go/pulsar/internal/pulsar_proto"
 )
 
 type messageID struct {
 	ledgerID     int64
 	entryID      int64
-	batchIdx     int
-	partitionIdx int
-
-	tracker  *ackTracker
-	consumer acker
+	batchIdx     int32
+	partitionIdx int32
 }
 
-func (id *messageID) Ack() {
+var latestMessageID = messageID{
+	ledgerID:     math.MaxInt64,
+	entryID:      math.MaxInt64,
+	batchIdx:     -1,
+	partitionIdx: -1,
+}
+
+var earliestMessageID = messageID{
+	ledgerID:     -1,
+	entryID:      -1,
+	batchIdx:     -1,
+	partitionIdx: -1,
+}
+
+type trackingMessageID struct {
+	messageID
+
+	tracker      *ackTracker
+	consumer     acker
+	receivedTime time.Time
+}
+
+func (id trackingMessageID) Undefined() bool {
+	return id == trackingMessageID{}
+}
+
+func (id trackingMessageID) Ack() {
 	if id.consumer == nil {
 		return
 	}
@@ -47,21 +72,25 @@ func (id *messageID) Ack() {
 	}
 }
 
-func (id *messageID) Nack() {
+func (id trackingMessageID) Nack() {
 	if id.consumer == nil {
 		return
 	}
 	id.consumer.NackID(id)
 }
 
-func (id *messageID) ack() bool {
+func (id trackingMessageID) ack() bool {
 	if id.tracker != nil && id.batchIdx > -1 {
-		return id.tracker.ack(id.batchIdx)
+		return id.tracker.ack(int(id.batchIdx))
 	}
 	return true
 }
 
-func (id *messageID) greater(other *messageID) bool {
+func (id messageID) isEntryIDValid() bool {
+	return id.entryID >= 0
+}
+
+func (id messageID) greater(other messageID) bool {
 	if id.ledgerID != other.ledgerID {
 		return id.ledgerID > other.ledgerID
 	}
@@ -73,25 +102,45 @@ func (id *messageID) greater(other *messageID) bool {
 	return id.batchIdx > other.batchIdx
 }
 
-func (id *messageID) equal(other *messageID) bool {
+func (id messageID) equal(other messageID) bool {
 	return id.ledgerID == other.ledgerID &&
 		id.entryID == other.entryID &&
 		id.batchIdx == other.batchIdx
 }
 
-func (id *messageID) greaterEqual(other *messageID) bool {
+func (id messageID) greaterEqual(other messageID) bool {
 	return id.equal(other) || id.greater(other)
 }
 
-func (id *messageID) Serialize() []byte {
+func (id messageID) Serialize() []byte {
 	msgID := &pb.MessageIdData{
 		LedgerId:   proto.Uint64(uint64(id.ledgerID)),
 		EntryId:    proto.Uint64(uint64(id.entryID)),
-		BatchIndex: proto.Int(id.batchIdx),
-		Partition:  proto.Int(id.partitionIdx),
+		BatchIndex: proto.Int32(id.batchIdx),
+		Partition:  proto.Int32(id.partitionIdx),
 	}
 	data, _ := proto.Marshal(msgID)
 	return data
+}
+
+func (id messageID) LedgerID() int64 {
+	return id.ledgerID
+}
+
+func (id messageID) EntryID() int64 {
+	return id.entryID
+}
+
+func (id messageID) BatchIdx() int32 {
+	return id.batchIdx
+}
+
+func (id messageID) PartitionIdx() int32 {
+	return id.partitionIdx
+}
+
+func (id messageID) String() string {
+	return fmt.Sprintf("%d:%d:%d", id.ledgerID, id.entryID, id.partitionIdx)
 }
 
 func deserializeMessageID(data []byte) (MessageID, error) {
@@ -103,14 +152,14 @@ func deserializeMessageID(data []byte) (MessageID, error) {
 	id := newMessageID(
 		int64(msgID.GetLedgerId()),
 		int64(msgID.GetEntryId()),
-		int(msgID.GetBatchIndex()),
-		int(msgID.GetPartition()),
+		msgID.GetBatchIndex(),
+		msgID.GetPartition(),
 	)
 	return id, nil
 }
 
-func newMessageID(ledgerID int64, entryID int64, batchIdx int, partitionIdx int) MessageID {
-	return &messageID{
+func newMessageID(ledgerID int64, entryID int64, batchIdx int32, partitionIdx int32) MessageID {
+	return messageID{
 		ledgerID:     ledgerID,
 		entryID:      entryID,
 		batchIdx:     batchIdx,
@@ -118,14 +167,30 @@ func newMessageID(ledgerID int64, entryID int64, batchIdx int, partitionIdx int)
 	}
 }
 
-func newTrackingMessageID(ledgerID int64, entryID int64, batchIdx int, partitionIdx int,
-	tracker *ackTracker) *messageID {
-	return &messageID{
-		ledgerID:     ledgerID,
-		entryID:      entryID,
-		batchIdx:     batchIdx,
-		partitionIdx: partitionIdx,
+func newTrackingMessageID(ledgerID int64, entryID int64, batchIdx int32, partitionIdx int32,
+	tracker *ackTracker) trackingMessageID {
+	return trackingMessageID{
+		messageID: messageID{
+			ledgerID:     ledgerID,
+			entryID:      entryID,
+			batchIdx:     batchIdx,
+			partitionIdx: partitionIdx,
+		},
 		tracker:      tracker,
+		receivedTime: time.Now(),
+	}
+}
+
+func toTrackingMessageID(msgID MessageID) (trackingMessageID, bool) {
+	if mid, ok := msgID.(messageID); ok {
+		return trackingMessageID{
+			messageID:    mid,
+			receivedTime: time.Now(),
+		}, true
+	} else if mid, ok := msgID.(trackingMessageID); ok {
+		return mid, true
+	} else {
+		return trackingMessageID{}, false
 	}
 }
 
@@ -140,12 +205,16 @@ type message struct {
 	publishTime         time.Time
 	eventTime           time.Time
 	key                 string
+	orderingKey         string
+	producerName        string
 	payLoad             []byte
 	msgID               MessageID
 	properties          map[string]string
 	topic               string
 	replicationClusters []string
+	replicatedFrom      string
 	redeliveryCount     uint32
+	schema              Schema
 }
 
 func (msg *message) Topic() string {
@@ -176,8 +245,28 @@ func (msg *message) Key() string {
 	return msg.key
 }
 
+func (msg *message) OrderingKey() string {
+	return msg.orderingKey
+}
+
 func (msg *message) RedeliveryCount() uint32 {
 	return msg.redeliveryCount
+}
+
+func (msg *message) IsReplicated() bool {
+	return msg.replicatedFrom != ""
+}
+
+func (msg *message) GetReplicatedFrom() string {
+	return msg.replicatedFrom
+}
+
+func (msg *message) GetSchemaValue(v interface{}) error {
+	return msg.schema.Decode(msg.payLoad, v)
+}
+
+func (msg *message) ProducerName() string {
+	return msg.producerName
 }
 
 func newAckTracker(size int) *ackTracker {

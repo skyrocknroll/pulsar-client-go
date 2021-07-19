@@ -66,7 +66,10 @@ type DLQPolicy struct {
 	MaxDeliveries uint32
 
 	// Name of the topic where the failing messages will be sent.
-	Topic string
+	DeadLetterTopic string
+
+	// Name of the topic where the retry messages will be sent.
+	RetryLetterTopic string
 }
 
 // ConsumerOptions is used to configure and create instances of Consumer
@@ -107,6 +110,13 @@ type ConsumerOptions struct {
 	// By default is nil and there's no DLQ
 	DLQ *DLQPolicy
 
+	// Configuration for Key Shared consumer policy.
+	KeySharedPolicy *KeySharedPolicy
+
+	// Auto retry send messages to default filled DLQPolicy topics
+	// Default is false
+	RetryEnable bool
+
 	// Sets a `MessageChannel` for the consumer
 	// When a message is received, it will be pushed to the channel for consumption
 	MessageChannel chan ConsumerMessage
@@ -116,7 +126,6 @@ type ConsumerOptions struct {
 	// application calls `Consumer.receive()`. Using a higher value could potentially increase the consumer
 	// throughput at the expense of bigger memory utilization.
 	// Default value is `1000` messages and should be good for most use cases.
-	// Set to -1 to disable prefetching in consumer
 	ReceiverQueueSize int
 
 	// The delay after which to redeliver the messages that failed to be
@@ -138,6 +147,14 @@ type ConsumerOptions struct {
 
 	// Mark the subscription as replicated to keep it in sync across clusters
 	ReplicateSubscriptionState bool
+
+	// A chain of interceptors, These interceptors will be called at some points defined in ConsumerInterceptor interface.
+	Interceptors ConsumerInterceptors
+
+	Schema Schema
+
+	// MaxReconnectToBroker set the maximum retry number of reconnectToBroker. (default: ultimate)
+	MaxReconnectToBroker *uint
 }
 
 // Consumer is an interface that abstracts behavior of Pulsar's consumer
@@ -160,6 +177,9 @@ type Consumer interface {
 
 	// AckID the consumption of a single message, identified by its MessageID
 	AckID(MessageID)
+
+	// ReconsumeLater mark a message for redelivery after custom delay
+	ReconsumeLater(msg Message, delay time.Duration)
 
 	// Acknowledge the failure to process a single message.
 	//
@@ -198,4 +218,7 @@ type Consumer interface {
 	//            the message publish time where to reposition the subscription
 	//
 	SeekByTime(time time.Time) error
+
+	// Name returns the name of consumer.
+	Name() string
 }

@@ -40,6 +40,19 @@ const (
 	ZSTD
 )
 
+type CompressionLevel int
+
+const (
+	// Default compression level
+	Default CompressionLevel = iota
+
+	// Faster compression, with lower compression ration
+	Faster
+
+	// Higher compression rate, but slower
+	Better
+)
+
 // TopicMetadata is a interface of topic metadata
 type TopicMetadata interface {
 	// NumPartitions get the number of partitions for the specific topic
@@ -62,6 +75,15 @@ type ProducerOptions struct {
 	// Properties attach a set of application defined properties to the producer
 	// This properties will be visible in the topic stats
 	Properties map[string]string
+
+	// SendTimeout set the timeout for a message that not be acknowledged by server since sent.
+	// Send and SendAsync returns an error after timeout.
+	// Default is 30 seconds, negative such as -1 to disable.
+	SendTimeout time.Duration
+
+	// DisableBlockIfQueueFull control whether Send and SendAsync block if producer's message queue is full.
+	// Default is false, if set to true then Send and SendAsync return error when queue is full.
+	DisableBlockIfQueueFull bool
 
 	// MaxPendingMessages set the max size of the queue holding the messages pending to receive an
 	// acknowledgment from the broker.
@@ -87,6 +109,12 @@ type ProducerOptions struct {
 	// release in order to be able to receive messages compressed with ZSTD.
 	CompressionType
 
+	// Define the desired compression level. Options:
+	// - Default
+	// - Faster
+	// - Better
+	CompressionLevel
+
 	// MessageRouter set a custom message routing policy by passing an implementation of MessageRouter
 	// The router is a function that given a particular message and the topic metadata, returns the
 	// partition index where the message should be routed to
@@ -109,8 +137,32 @@ type ProducerOptions struct {
 
 	// BatchingMaxMessages set the maximum number of messages permitted in a batch. (default: 1000)
 	// If set to a value greater than 1, messages will be queued until this threshold is reached or
-	// batch interval has elapsed.
+	// BatchingMaxSize (see below) has been reached or the batch interval has elapsed.
 	BatchingMaxMessages uint
+
+	// BatchingMaxSize sets the maximum number of bytes permitted in a batch. (default 128 KB)
+	// If set to a value greater than 1, messages will be queued until this threshold is reached or
+	// BatchingMaxMessages (see above) has been reached or the batch interval has elapsed.
+	BatchingMaxSize uint
+
+	// A chain of interceptors, These interceptors will be called at some points defined in ProducerInterceptor interface
+	Interceptors ProducerInterceptors
+
+	Schema Schema
+
+	// MaxReconnectToBroker set the maximum retry number of reconnectToBroker. (default: ultimate)
+	MaxReconnectToBroker *uint
+
+	// BatcherBuilderType sets the batch builder type (default DefaultBatchBuilder)
+	// This will be used to create batch container when batching is enabled.
+	// Options:
+	// - DefaultBatchBuilder
+	// - KeyBasedBatchBuilder
+	BatcherBuilderType
+
+	// PartitionsAutoDiscoveryInterval is the time interval for the background process to discover new partitions
+	// Default is 1 minute
+	PartitionsAutoDiscoveryInterval time.Duration
 }
 
 // Producer is used to publish messages on a topic
@@ -128,6 +180,8 @@ type Producer interface {
 	Send(context.Context, *ProducerMessage) (MessageID, error)
 
 	// SendAsync a message in asynchronous mode
+	// This call is blocked when the `event channel` becomes full (default: 10) or the
+	// `maxPendingMessages` becomes full (default: 1000)
 	// The callback will report back the message being published and
 	// the eventual error in publishing
 	SendAsync(context.Context, *ProducerMessage, func(MessageID, *ProducerMessage, error))
